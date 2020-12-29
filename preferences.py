@@ -12,7 +12,7 @@ class BrignetPrefs(bpy.types.AddonPreferences):
 
         if not os.path.isdir(env_path):
             return False
-            
+
         if sys.platform.startswith("linux"):
             lib_path = os.path.join(env_path, 'lib')
             sitepackages = os.path.join(lib_path, 'python3.7', 'site-packages')
@@ -49,12 +49,18 @@ class BrignetPrefs(bpy.types.AddonPreferences):
         if not os.path.isdir(rignet_path):
             return False
 
-        if not os.path.isdir(os.path.join(rignet_path, "utils")):
+        dirname = os.path.dirname(rignet_path) if rignet_path.endswith(os.sep) else rignet_path
+        dirname = os.path.dirname(dirname)
+        dirname = os.path.dirname(dirname)
+        util_dir = os.path.join(dirname, "util")
+        if not os.path.isdir(util_dir):
             # not the rignet path, but the user might still be typing
             return False
 
         if not rignet_path in sys.path:
             sys.path.append(rignet_path)
+        if not util_dir in sys.path:
+            sys.path.append(util_dir)
 
         return True
 
@@ -72,18 +78,11 @@ class BrignetPrefs(bpy.types.AddonPreferences):
     )
 
     rignet_path: bpy.props.StringProperty(
-        name='RigNet path',
-        description='Path to RigNet code',
+        name='ailia-rignet path',
+        description='Path to ailia-rignet',
         subtype='DIR_PATH',
-        default=os.path.join(os.path.dirname(__file__), 'RigNet'),
+        default=os.path.join('', 'ailia-models', 'rigging', 'rignet'),
         update=update_rignet
-    )
-
-    model_path: bpy.props.StringProperty(
-        name='Model path',
-        description='Path to RigNet code',
-        subtype='DIR_PATH',
-        default=os.path.join(os.path.join(os.path.dirname(__file__)), 'RigNet', 'checkpoints')
     )
 
     def draw(self, context):
@@ -96,9 +95,7 @@ class BrignetPrefs(bpy.types.AddonPreferences):
         row = col.row()
         row.prop(self, 'modules_path', text='Modules Path')
         row = col.row()
-        row.prop(self, 'rignet_path', text='RigNet Path')
-        row = col.row()
-        row.prop(self, 'model_path', text='Model Path')
+        row.prop(self, 'rignet_path', text='ailia-rignet Path')
 
         row = layout.row()
         row.label(text="End of bRigNet Preferences")

@@ -75,7 +75,7 @@ def unregister():
     try:
         from . import rignetconnect
         rignetconnect.clear()
-    except ModuleNotFoundError:
+    except (OSError, ModuleNotFoundError):
         # if we have failed to load rignetconnect, we have no device to clear
         pass
 

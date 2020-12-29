@@ -1,43 +1,69 @@
 import os
 import sys
+import time
 import subprocess
-
-import trimesh
-import numpy as np
-import open3d as o3d
 import itertools as it
+import tempfile
 
-import torch
-from torch_geometric.data import Data
-from torch_geometric.utils import add_self_loops
-
-from utils import binvox_rw
-from utils.rig_parser import Skel, Info
-from utils.tree_utils import TreeNode
-from utils.io_utils import assemble_skel_skin
-from utils.vis_utils import draw_shifted_pts, show_obj_skel, show_mesh_vox
-from utils.cluster_utils import meanshift_cluster, nms_meanshift
-from utils.mst_utils import increase_cost_for_outside_bone, primMST_symmetry, loadSkel_recur, inside_check, flip
-
-from geometric_proc.common_ops import get_bones, calc_surface_geodesic
-from geometric_proc.compute_volumetric_geodesic import pts2line, calc_pts2bone_visible_mat
-
-from gen_dataset import get_tpl_edges, get_geo_edges
-from mst_generate import sample_on_bone, getInitId
-from run_skinning import post_filter
-
-from models.GCN import JOINTNET_MASKNET_MEANSHIFT as JOINTNET
-from models.ROOT_GCN import ROOTNET
-from models.PairCls_GCN import PairCls as BONENET
-from models.SKINNING import SKINNET
+import numpy as np
+from scipy.sparse import lil_matrix
+from scipy.sparse.csgraph import dijkstra
+import open3d as o3d
+import trimesh
 
 import bpy
 import bmesh
 from mathutils import Matrix
-import tempfile
 from .rigutils import ArmatureGenerator
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+import onnxruntime
+
+import ailia
+from model_utils import check_and_download_models  # noqa: E402
+import binvox_rw
+from rignet_utils import inside_check, sample_on_bone
+from rignet_utils import meanshift_cluster, nms_meanshift, flip
+from rignet_utils import increase_cost_for_outside_bone
+from rignet_utils import RigInfo, TreeNode, primMST_symmetry, loadSkel_recur
+from rignet_utils import get_bones, calc_geodesic_matrix, post_filter, assemble_skel_skin
+from vis_utils import draw_shifted_pts, show_obj_skel
+
+WEIGHT_JOINTNET_PATH = 'models/gcn_meanshift.onnx'
+MODEL_JOINTNET_PATH = 'models/gcn_meanshift.onnx.prototxt'
+WEIGHT_ROOTNET_SE_PATH = 'models/rootnet_shape_enc.onnx'
+MODEL_ROOTNET_SE_PATH = 'models/rootnet_shape_enc.onnx.prototxt'
+WEIGHT_ROOTNET_SA1_PATH = 'models/rootnet_sa1_conv.onnx'
+MODEL_ROOTNET_SA1_PATH = 'models/rootnet_sa1_conv.onnx.prototxt'
+WEIGHT_ROOTNET_SA2_PATH = 'models/rootnet_sa2_conv.onnx'
+MODEL_ROOTNET_SA2_PATH = 'models/rootnet_sa2_conv.onnx.prototxt'
+WEIGHT_ROOTNET_SA3_PATH = 'models/rootnet_sa3.onnx'
+MODEL_ROOTNET_SA3_PATH = 'models/rootnet_sa3.onnx.prototxt'
+WEIGHT_ROOTNET_FP3_PATH = 'models/rootnet_fp3_nn.onnx'
+MODEL_ROOTNET_FP3_PATH = 'models/rootnet_fp3_nn.onnx.prototxt'
+WEIGHT_ROOTNET_FP2_PATH = 'models/rootnet_fp2_nn.onnx'
+MODEL_ROOTNET_FP2_PATH = 'models/rootnet_fp2_nn.onnx.prototxt'
+WEIGHT_ROOTNET_FP1_PATH = 'models/rootnet_fp1_nn.onnx'
+MODEL_ROOTNET_FP1_PATH = 'models/rootnet_fp1_nn.onnx.prototxt'
+WEIGHT_ROOTNET_BL_PATH = 'models/rootnet_back_layers.onnx'
+MODEL_ROOTNET_BL_PATH = 'models/rootnet_back_layers.onnx.prototxt'
+WEIGHT_BONENET_SA1_PATH = 'models/bonenet_sa1_conv.onnx'
+MODEL_BONENET_SA1_PATH = 'models/bonenet_sa1_conv.onnx.prototxt'
+WEIGHT_BONENET_SA2_PATH = 'models/bonenet_sa2_conv.onnx'
+MODEL_BONENET_SA2_PATH = 'models/bonenet_sa2_conv.onnx.prototxt'
+WEIGHT_BONENET_SA3_PATH = 'models/bonenet_sa3.onnx'
+MODEL_BONENET_SA3_PATH = 'models/bonenet_sa3.onnx.prototxt'
+WEIGHT_BONENET_SE_PATH = 'models/bonenet_shape_enc.onnx'
+MODEL_BONENET_SE_PATH = 'models/bonenet_shape_enc.onnx.prototxt'
+WEIGHT_BONENET_EF_PATH = 'models/bonenet_expand_joint_feature.onnx'
+MODEL_BONENET_EF_PATH = 'models/bonenet_expand_joint_feature.onnx.prototxt'
+WEIGHT_BONENET_MT_PATH = 'models/bonenet_mix_transform.onnx'
+MODEL_BONENET_MT_PATH = 'models/bonenet_mix_transform.onnx.prototxt'
+WEIGHT_SKINNET_PATH = 'models/skinnet.onnx'
+MODEL_SKINNET_PATH = 'models/skinnet.onnx.prototxt'
+
+REMOTE_PATH = \
+    'https://storage.googleapis.com/ailia-models/rignet/'
+
 MESH_NORMALIZED = None
 
 
@@ -53,6 +79,84 @@ def normalize_obj(mesh_v):
     mesh_v[:, 2] -= pivot[2]
     mesh_v *= scale
     return mesh_v, pivot, scale
+
+
+def get_tpl_edges(remesh_obj_v, remesh_obj_f):
+    edge_index = []
+    for v in range(len(remesh_obj_v)):
+        face_ids = np.argwhere(remesh_obj_f == v)[:, 0]
+        neighbor_ids = set()
+        for face_id in face_ids:
+            for v_id in range(3):
+                if remesh_obj_f[face_id, v_id] != v:
+                    neighbor_ids.add(remesh_obj_f[face_id, v_id])
+        neighbor_ids = list(neighbor_ids)
+        neighbor_ids = [np.array([v, n])[np.newaxis, :] for n in neighbor_ids]
+        neighbor_ids = np.concatenate(neighbor_ids, axis=0)
+        edge_index.append(neighbor_ids)
+    edge_index = np.concatenate(edge_index, axis=0)
+    return edge_index
+
+
+def get_geo_edges(surface_geodesic, remesh_obj_v):
+    edge_index = []
+    surface_geodesic += 1.0 * np.eye(len(surface_geodesic))  # remove self-loop edge here
+    for i in range(len(remesh_obj_v)):
+        geodesic_ball_samples = np.argwhere(surface_geodesic[i, :] <= 0.06).squeeze(1)
+        if len(geodesic_ball_samples) > 10:
+            geodesic_ball_samples = np.random.choice(geodesic_ball_samples, 10, replace=False)
+        edge_index.append(np.concatenate((np.repeat(i, len(geodesic_ball_samples))[:, np.newaxis],
+                                          geodesic_ball_samples[:, np.newaxis]), axis=1))
+    edge_index = np.concatenate(edge_index, axis=0)
+    return edge_index
+
+
+def add_self_loops(
+        edge_index, num_nodes=None):
+    N = np.max(edge_index) + 1 if num_nodes is None else num_nodes
+    loop_index = np.arange(N)
+    loop_index = np.repeat(np.expand_dims(loop_index, 0), 2, axis=0)
+    edge_index = np.concatenate([edge_index, loop_index], axis=1)
+    return edge_index
+
+
+def calc_surface_geodesic(mesh):
+    # We denselu sample 4000 points to be more accuracy.
+    samples = mesh.sample_points_poisson_disk(number_of_points=4000)
+    pts = np.asarray(samples.points)
+    pts_normal = np.asarray(samples.normals)
+
+    time1 = time.time()
+    N = len(pts)
+    verts_dist = np.sqrt(np.sum((pts[np.newaxis, ...] - pts[:, np.newaxis, :]) ** 2, axis=2))
+    verts_nn = np.argsort(verts_dist, axis=1)
+    conn_matrix = lil_matrix((N, N), dtype=np.float32)
+
+    for p in range(N):
+        nn_p = verts_nn[p, 1:6]
+        norm_nn_p = np.linalg.norm(pts_normal[nn_p], axis=1)
+        norm_p = np.linalg.norm(pts_normal[p])
+        cos_similar = np.dot(pts_normal[nn_p], pts_normal[p]) / (norm_nn_p * norm_p + 1e-10)
+        nn_p = nn_p[cos_similar > -0.5]
+        conn_matrix[p, nn_p] = verts_dist[p, nn_p]
+    [dist, _] = dijkstra(conn_matrix, directed=False, indices=range(N),
+                         return_predecessors=True, unweighted=False)
+
+    # replace inf distance with euclidean distance + 8
+    # 6.12 is the maximal geodesic distance without considering inf, I add 8 to be safer.
+    inf_pos = np.argwhere(np.isinf(dist))
+    if len(inf_pos) > 0:
+        euc_distance = np.sqrt(np.sum((pts[np.newaxis, ...] - pts[:, np.newaxis, :]) ** 2, axis=2))
+        dist[inf_pos[:, 0], inf_pos[:, 1]] = 8.0 + euc_distance[inf_pos[:, 0], inf_pos[:, 1]]
+
+    verts = np.array(mesh.vertices)
+    vert_pts_distance = np.sqrt(np.sum((verts[np.newaxis, ...] - pts[:, np.newaxis, :]) ** 2, axis=2))
+    vert_pts_nn = np.argmin(vert_pts_distance, axis=0)
+    surface_geodesic = dist[vert_pts_nn, :][:, vert_pts_nn]
+    time2 = time.time()
+
+    print('surface geodesic calculation: {} seconds'.format((time2 - time1)))
+    return surface_geodesic
 
 
 def create_single_data(mesh_obj):
@@ -100,29 +204,35 @@ def create_single_data(mesh_obj):
     mesh_f = np.asarray(mesh.triangles)
 
     mesh_v, translation_normalize, scale_normalize = normalize_obj(mesh_v)
-    mesh_normalized = o3d.geometry.TriangleMesh(vertices=o3d.utility.Vector3dVector(mesh_v),
-                                                triangles=o3d.utility.Vector3iVector(mesh_f))
+    mesh_normalized = o3d.geometry.TriangleMesh(
+        vertices=o3d.utility.Vector3dVector(mesh_v),
+        triangles=o3d.utility.Vector3iVector(mesh_f))
     global MESH_NORMALIZED
     MESH_NORMALIZED = mesh_normalized
 
     # vertices
     v = np.concatenate((mesh_v, mesh_vn), axis=1)
-    v = torch.from_numpy(v).float()
+    v = v.astype(np.float32)
+
     # topology edges
     print("     gathering topological edges.")
     tpl_e = get_tpl_edges(mesh_v, mesh_f).T
-    tpl_e = torch.from_numpy(tpl_e).long()
-    tpl_e, _ = add_self_loops(tpl_e, num_nodes=v.size(0))
+    tpl_e, _ = add_self_loops(tpl_e, num_nodes=v.shape[0])
+    tpl_e = tpl_e.astype(np.int64)
+
     # surface geodesic distance matrix
     print("     calculating surface geodesic matrix.")
     surface_geodesic = calc_surface_geodesic(mesh)
+
     # geodesic edges
     print("     gathering geodesic edges.")
     geo_e = get_geo_edges(surface_geodesic, mesh_v).T
-    geo_e = torch.from_numpy(geo_e).long()
-    geo_e, _ = add_self_loops(geo_e, num_nodes=v.size(0))
+    geo_e, _ = add_self_loops(geo_e, num_nodes=v.shape[0])
+    geo_e = geo_e.astype(np.int64)
+
     # batch
-    batch = torch.zeros(len(v), dtype=torch.long)
+    batch = np.zeros(len(v), dtype=np.int64)
+
     # voxel
     fo_normalized = tempfile.NamedTemporaryFile(suffix='_normalized.obj')
     fo_normalized.close()
@@ -138,7 +248,6 @@ def create_single_data(mesh_obj):
 
     if not os.path.isfile(binvox_exe):
         os.unlink(fo_normalized.name)
-        clear()
         raise FileNotFoundError("binvox executable not found in {0}, please check RigNet path in the addon preferences")
 
     subprocess.call([binvox_exe, "-d", "88", fo_normalized.name])
@@ -147,7 +256,10 @@ def create_single_data(mesh_obj):
 
     os.unlink(fo_normalized.name)
 
-    data = Data(x=v[:, 3:6], pos=v[:, 0:3], tpl_edge_index=tpl_e, geo_edge_index=geo_e, batch=batch)
+    data = dict(
+        batch=batch, pos=v[:, 0:3],
+        tpl_edge_index=tpl_e, geo_edge_index=geo_e,
+    )
     return data, vox, surface_geodesic, translation_normalize, scale_normalize
 
 
@@ -377,7 +489,9 @@ def calc_geodesic_matrix_2(bones, mesh_v, surface_geodesic, use_sampling=False, 
     return visible_matrix
 
 
-def predict_skinning(input_data, pred_skel, skin_pred_net, surface_geodesic, subsampling=False, decimation=3000, sampling=1500):
+def predict_skinning(
+        input_data, pred_skel, skin_pred_net, surface_geodesic,
+        subsampling=False, decimation=3000, sampling=1500):
     """
     predict skinning
     :param input_data: wrapped input data
@@ -387,13 +501,15 @@ def predict_skinning(input_data, pred_skel, skin_pred_net, surface_geodesic, sub
     :param mesh_filename: mesh filename
     :return: predicted rig with skinning weights information
     """
-    global device, output_folder
+    global output_folder
     num_nearest_bone = 5
     bones, bone_names, bone_isleaf = get_bones(pred_skel)
     mesh_v = input_data.pos.data.cpu().numpy()
     print("     calculating volumetric geodesic distance from vertices to bone. This step takes some time...")
 
-    geo_dist = calc_geodesic_matrix_2(bones, mesh_v, surface_geodesic, use_sampling=subsampling, decimation=decimation, sampling=sampling)
+    geo_dist = calc_geodesic_matrix_2(
+        bones, mesh_v, surface_geodesic,
+        use_sampling=subsampling, decimation=decimation, sampling=sampling)
     input_samples = []  # joint_pos (x, y, z), (bone_id, 1/D)*5
     loss_mask = []
     skin_nn = []
@@ -426,7 +542,6 @@ def predict_skinning(input_data, pred_skel, skin_pred_net, surface_geodesic, sub
     skin_nn = np.concatenate(skin_nn, axis=0)
     skin_input = torch.from_numpy(skin_input).float()
     input_data.skin_input = skin_input
-    input_data.to(device)
 
     skin_pred = skin_pred_net(input_data)
     skin_pred = torch.softmax(skin_pred, dim=1)
@@ -456,49 +571,107 @@ def predict_rig(mesh_obj, bandwidth, threshold, downsample_skinning=True, decima
     # load all weights
     print("loading all networks...")
 
-    model_dir = bpy.context.preferences.addons[__package__].preferences.model_path
+    rignet_path = bpy.context.preferences.addons[__package__].preferences.rignet_path
+    print("rignet_path---->", rignet_path)
 
-    jointNet = JOINTNET()
-    jointNet.to(device)
-    jointNet.eval()
-    jointNet_checkpoint = torch.load(os.path.join(model_dir, 'gcn_meanshift/model_best.pth.tar'))
-    jointNet.load_state_dict(jointNet_checkpoint['state_dict'])
-    print("     joint prediction network loaded.")
+    print('=== JOINETNET ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_JOINTNET_PATH), os.path.join(rignet_path, MODEL_JOINTNET_PATH), REMOTE_PATH)
+    print('=== ROOTNET (1/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_SE_PATH), os.path.join(rignet_path, MODEL_ROOTNET_SE_PATH),
+        REMOTE_PATH)
+    print('=== ROOTNET (2/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_SA1_PATH), os.path.join(rignet_path, MODEL_ROOTNET_SA1_PATH),
+        REMOTE_PATH)
+    print('=== ROOTNET (3/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_SA2_PATH), os.path.join(rignet_path, MODEL_ROOTNET_SA2_PATH),
+        REMOTE_PATH)
+    print('=== ROOTNET (4/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_SA3_PATH), os.path.join(rignet_path, MODEL_ROOTNET_SA3_PATH),
+        REMOTE_PATH)
+    print('=== ROOTNET (5/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_FP3_PATH), os.path.join(rignet_path, MODEL_ROOTNET_FP3_PATH),
+        REMOTE_PATH)
+    print('=== ROOTNET (6/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_FP2_PATH), os.path.join(rignet_path, MODEL_ROOTNET_FP2_PATH),
+        REMOTE_PATH)
+    print('=== ROOTNET (7/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_FP1_PATH), os.path.join(rignet_path, MODEL_ROOTNET_FP1_PATH),
+        REMOTE_PATH)
+    print('=== ROOTNET (8/8) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_ROOTNET_BL_PATH), os.path.join(rignet_path, MODEL_ROOTNET_BL_PATH),
+        REMOTE_PATH)
+    print('=== BONENET (1/6) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_BONENET_SA1_PATH), os.path.join(rignet_path, MODEL_BONENET_SA1_PATH),
+        REMOTE_PATH)
+    print('=== BONENET (2/6) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_BONENET_SA2_PATH), os.path.join(rignet_path, MODEL_BONENET_SA2_PATH),
+        REMOTE_PATH)
+    print('=== BONENET (3/6) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_BONENET_SA3_PATH), os.path.join(rignet_path, MODEL_BONENET_SA3_PATH),
+        REMOTE_PATH)
+    print('=== BONENET (4/6) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_BONENET_SE_PATH), os.path.join(rignet_path, MODEL_BONENET_SE_PATH),
+        REMOTE_PATH)
+    print('=== BONENET (5/6) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_BONENET_EF_PATH), os.path.join(rignet_path, MODEL_BONENET_EF_PATH),
+        REMOTE_PATH)
+    print('=== BONENET (6/6) ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_BONENET_MT_PATH), os.path.join(rignet_path, MODEL_BONENET_MT_PATH),
+        REMOTE_PATH)
+    print('=== SKINNET ===')
+    check_and_download_models(
+        os.path.join(rignet_path, WEIGHT_SKINNET_PATH), os.path.join(rignet_path, MODEL_SKINNET_PATH), REMOTE_PATH)
 
-    rootNet = ROOTNET()
-    rootNet.to(device)
-    rootNet.eval()
-    rootNet_checkpoint = torch.load(os.path.join(model_dir, 'rootnet/model_best.pth.tar'))
-    rootNet.load_state_dict(rootNet_checkpoint['state_dict'])
-    print("     root prediction network loaded.")
-
-    boneNet = BONENET()
-    boneNet.to(device)
-    boneNet.eval()
-    boneNet_checkpoint = torch.load(os.path.join(model_dir, 'bonenet/model_best.pth.tar'))
-    boneNet.load_state_dict(boneNet_checkpoint['state_dict'])
-    print("     connection prediction network loaded.")
-
-    skinNet = SKINNET(nearest_bone=5, use_Dg=True, use_Lf=True)
-    skinNet_checkpoint = torch.load(os.path.join(model_dir, 'skinnet/model_best.pth.tar'))
-    skinNet.load_state_dict(skinNet_checkpoint['state_dict'])
-    skinNet.to(device)
-    skinNet.eval()
-    print("     skinning prediction network loaded.")
+    net_info = {}
+    net_info['jointNet'] = onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_JOINTNET_PATH))
+    net_info['rootNet'] = {
+        'shape_encoder': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SE_PATH)),
+        'sa1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA1_PATH)),
+        'sa2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA2_PATH)),
+        'sa3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA3_PATH)),
+        'fp3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP3_PATH)),
+        'fp2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP2_PATH)),
+        'fp1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP1_PATH)),
+        'back_layers': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_BL_PATH)),
+    }
+    net_info['boneNet'] = {
+        'sa1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA1_PATH)),
+        'sa2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA2_PATH)),
+        'sa3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA3_PATH)),
+        'shape_encoder': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SE_PATH)),
+        'expand_joint_feature': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_EF_PATH)),
+        'mix_transform': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_MT_PATH)),
+    }
+    net_info['skinNet'] = onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_SKINNET_PATH))
 
     data, vox, surface_geodesic, translation_normalize, scale_normalize = create_single_data(mesh_obj)
-    data.to(device)
 
     print("predicting joints")
     data = predict_joints(data, vox, jointNet, threshold, bandwidth=bandwidth)
 
-    data.to(device)
     print("predicting connectivity")
     pred_skeleton = predict_skeleton(data, vox, rootNet, boneNet)
     # pred_skeleton.normalize(scale_normalize, -translation_normalize)
 
     print("predicting skinning")
-    pred_rig = predict_skinning(data, pred_skeleton, skinNet, surface_geodesic, subsampling=downsample_skinning, decimation=decimation, sampling=sampling)
+    pred_rig = predict_skinning(
+        data, pred_skeleton, skinNet, surface_geodesic,
+        subsampling=downsample_skinning, decimation=decimation, sampling=sampling)
 
     # here we reverse the normalization to the original scale and position
     pred_rig.normalize(scale_normalize, -translation_normalize)
@@ -513,8 +686,3 @@ def predict_rig(mesh_obj, bandwidth, threshold, downsample_skinning=True, decima
                   (0.0, 1, 0, 0.0),
                   (0.0, 0.0, 0.0, 1.0)))
     ArmatureGenerator(pred_rig, mesh_obj).generate(matrix=mat)
-    torch.cuda.empty_cache()
-
-
-def clear():
-    torch.cuda.empty_cache()
