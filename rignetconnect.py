@@ -878,26 +878,67 @@ def predict_rig(mesh_obj, bandwidth, threshold, downsample_skinning=True, decima
         os.path.join(rignet_path, WEIGHT_SKINNET_PATH), os.path.join(rignet_path, MODEL_SKINNET_PATH), REMOTE_PATH)
 
     net_info = {}
-    net_info['jointNet'] = onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_JOINTNET_PATH))
-    net_info['rootNet'] = {
-        'shape_encoder': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SE_PATH)),
-        'sa1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA1_PATH)),
-        'sa2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA2_PATH)),
-        'sa3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA3_PATH)),
-        'fp3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP3_PATH)),
-        'fp2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP2_PATH)),
-        'fp1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP1_PATH)),
-        'back_layers': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_BL_PATH)),
-    }
-    net_info['boneNet'] = {
-        'sa1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA1_PATH)),
-        'sa2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA2_PATH)),
-        'sa3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA3_PATH)),
-        'shape_encoder': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SE_PATH)),
-        'expand_joint_feature': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_EF_PATH)),
-        'mix_transform': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_MT_PATH)),
-    }
-    net_info['skinNet'] = onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_SKINNET_PATH))
+    if not ONNX_RUNTIME:
+        env_id = ailia.get_gpu_environment_id()
+        print(f'env_id: {env_id}')
+
+        net_info['jointNet'] = ailia.Net(
+            os.path.join(rignet_path, MODEL_JOINTNET_PATH), os.path.join(rignet_path, WEIGHT_JOINTNET_PATH), env_id=env_id)
+        net_info['rootNet'] = {
+            'shape_encoder': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_SE_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_SE_PATH), env_id=env_id),
+            'sa1_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_SA1_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_SA1_PATH), env_id=env_id),
+            'sa2_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_SA2_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_SA2_PATH), env_id=env_id),
+            'sa3_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_SA3_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_SA3_PATH), env_id=env_id),
+            'fp3_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_FP3_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_FP3_PATH), env_id=env_id),
+            'fp2_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_FP2_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_FP2_PATH), env_id=env_id),
+            'fp1_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_FP1_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_FP1_PATH), env_id=env_id),
+            'back_layers': ailia.Net(
+                os.path.join(rignet_path, MODEL_ROOTNET_BL_PATH), os.path.join(rignet_path, WEIGHT_ROOTNET_BL_PATH), env_id=env_id),
+        }
+        net_info['boneNet'] = {
+            'sa1_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_BONENET_SA1_PATH), os.path.join(rignet_path, WEIGHT_BONENET_SA1_PATH), env_id=env_id),
+            'sa2_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_BONENET_SA2_PATH), os.path.join(rignet_path, WEIGHT_BONENET_SA2_PATH), env_id=env_id),
+            'sa3_module': ailia.Net(
+                os.path.join(rignet_path, MODEL_BONENET_SA3_PATH), os.path.join(rignet_path, WEIGHT_BONENET_SA3_PATH), env_id=env_id),
+            'shape_encoder': ailia.Net(
+                os.path.join(rignet_path, MODEL_BONENET_SE_PATH), os.path.join(rignet_path, WEIGHT_BONENET_SE_PATH), env_id=env_id),
+            'expand_joint_feature': ailia.Net(
+                os.path.join(rignet_path, MODEL_BONENET_EF_PATH), os.path.join(rignet_path, WEIGHT_BONENET_EF_PATH), env_id=env_id),
+            'mix_transform': ailia.Net(
+                os.path.join(rignet_path, MODEL_BONENET_MT_PATH), os.path.join(rignet_path, WEIGHT_BONENET_MT_PATH), env_id=env_id),
+        }
+        net_info['skinNet'] = ailia.Net(
+            os.path.join(rignet_path, MODEL_SKINNET_PATH), os.path.join(rignet_path, WEIGHT_SKINNET_PATH), env_id=env_id)
+    else:
+        net_info['jointNet'] = onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_JOINTNET_PATH))
+        net_info['rootNet'] = {
+            'shape_encoder': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SE_PATH)),
+            'sa1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA1_PATH)),
+            'sa2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA2_PATH)),
+            'sa3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_SA3_PATH)),
+            'fp3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP3_PATH)),
+            'fp2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP2_PATH)),
+            'fp1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_FP1_PATH)),
+            'back_layers': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_ROOTNET_BL_PATH)),
+        }
+        net_info['boneNet'] = {
+            'sa1_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA1_PATH)),
+            'sa2_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA2_PATH)),
+            'sa3_module': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SA3_PATH)),
+            'shape_encoder': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_SE_PATH)),
+            'expand_joint_feature': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_EF_PATH)),
+            'mix_transform': onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_BONENET_MT_PATH)),
+        }
+        net_info['skinNet'] = onnxruntime.InferenceSession(os.path.join(rignet_path, WEIGHT_SKINNET_PATH))
 
     data, vox, surface_geodesic, translation_normalize, scale_normalize = create_single_data(mesh_obj)
 
